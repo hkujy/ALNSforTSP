@@ -329,11 +329,25 @@ class ALNSAlgorithm:
         self.destroy_probabilities = np.ones(parameters.destroy_operators_count) / parameters.destroy_operators_count
         self.repair_probabilities = np.ones(parameters.repair_operators_count) / parameters.repair_operators_count
         
-        # Statistics tracking
+        # Statistics tracking (for current segment)
         self.destroy_usage_count = np.zeros(parameters.destroy_operators_count)
         self.repair_usage_count = np.zeros(parameters.repair_operators_count)
         self.destroy_scores = np.zeros(parameters.destroy_operators_count)
         self.repair_scores = np.zeros(parameters.repair_operators_count)
+        
+        # Timing statistics (for current segment)
+        self.destroy_total_time = np.zeros(parameters.destroy_operators_count)
+        self.repair_total_time = np.zeros(parameters.repair_operators_count)
+        
+        # Cumulative statistics (for entire run)
+        self.destroy_total_usage = np.zeros(parameters.destroy_operators_count)
+        self.repair_total_usage = np.zeros(parameters.repair_operators_count)
+        self.destroy_cumulative_time = np.zeros(parameters.destroy_operators_count)
+        self.repair_cumulative_time = np.zeros(parameters.repair_operators_count)
+        
+        # Average timing (calculated from cumulative)
+        self.destroy_avg_time = np.zeros(parameters.destroy_operators_count)
+        self.repair_avg_time = np.zeros(parameters.repair_operators_count)
     
     def _select_destroy_operator(self) -> int:
         """Select destroy operator based on current probabilities."""
@@ -361,28 +375,50 @@ class ALNSAlgorithm:
                 return i
         return len(cumulative_probs) - 1
     
-    def _apply_destroy_operator(self, solution: List[int], operator_id: int) -> Tuple[List[int], List[int]]:
-        """Apply selected destroy operator."""
+    def _apply_destroy_operator(self, solution: List[int], operator_id: int) -> Tuple[List[int], List[int], float]:
+        """
+        Apply selected destroy operator and measure execution time.
+        
+        Returns:
+            Tuple of (partial_solution, removed_cities, execution_time)
+        """
+        start_time = time.perf_counter()
+        
         if operator_id == 0:
-            return self.destroy_ops.random_removal(solution, self.tsp_solver.city_count)
+            result = self.destroy_ops.random_removal(solution, self.tsp_solver.city_count)
         elif operator_id == 1:
-            return self.destroy_ops.worst_distance_removal(solution, self.tsp_solver.distance_matrix)
+            result = self.destroy_ops.worst_distance_removal(solution, self.tsp_solver.distance_matrix)
         else:
             raise ValueError(f"Unknown destroy operator: {operator_id}")
+        
+        end_time = time.perf_counter()
+        execution_time = end_time - start_time
+        
+        return result[0], result[1], execution_time
     
     def _apply_repair_operator(self, partial_solution: List[int], removed_cities: List[int], 
-                              operator_id: int) -> List[int]:
-        """Apply selected repair operator."""
+                              operator_id: int) -> Tuple[List[int], float]:
+        """
+        Apply selected repair operator and measure execution time.
+        
+        Returns:
+            Tuple of (complete_solution, execution_time)
+        """
+        start_time = time.perf_counter()
+        
         if operator_id == 0:
             result, _ = self.repair_ops.greedy_insertion(
                 partial_solution, removed_cities, self.tsp_solver.distance_matrix)
-            return result
         elif operator_id == 1:
             result, _ = self.repair_ops.noisy_greedy_insertion(
                 partial_solution, removed_cities, self.tsp_solver.distance_matrix, self.params.noise_factor)
-            return result
         else:
             raise ValueError(f"Unknown repair operator: {operator_id}")
+        
+        end_time = time.perf_counter()
+        execution_time = end_time - start_time
+        
+        return result, execution_time
     
     def _update_operator_weights(self):
         """Update operator weights based on performance scores."""
@@ -417,6 +453,35 @@ class ALNSAlgorithm:
         self.repair_usage_count.fill(0)
         self.destroy_scores.fill(0)
         self.repair_scores.fill(0)
+        self.destroy_total_time.fill(0)
+        self.repair_total_time.fill(0)
+    
+    def _update_timing_statistics(self):
+        """Update average timing statistics for operators."""
+        # Calculate average execution times from cumulative data
+        for i in range(self.params.destroy_operators_count):
+            if self.destroy_total_usage[i] > 0:
+                self.destroy_avg_time[i] = self.destroy_cumulative_time[i] / self.destroy_total_usage[i]
+        
+        for i in range(self.params.repair_operators_count):
+            if self.repair_total_usage[i] > 0:
+                self.repair_avg_time[i] = self.repair_cumulative_time[i] / self.repair_total_usage[i]
+    
+    def get_timing_statistics(self) -> Dict[str, Any]:
+        """
+        Get comprehensive timing statistics for all operators.
+        
+        Returns:
+            Dictionary containing timing statistics
+        """
+        return {
+            'destroy_avg_times': self.destroy_avg_time.copy(),
+            'repair_avg_times': self.repair_avg_time.copy(),
+            'destroy_total_times': self.destroy_cumulative_time.copy(),
+            'repair_total_times': self.repair_cumulative_time.copy(),
+            'destroy_usage_counts': self.destroy_total_usage.copy(),
+            'repair_usage_counts': self.repair_total_usage.copy()
+        }
     
     def solve(self) -> Tuple[List[int], float, List[float]]:
         """
@@ -451,11 +516,21 @@ class ALNSAlgorithm:
             self.repair_usage_count[repair_op] += 1
             
             # Apply destroy operator
-            partial_solution, removed_cities = self._apply_destroy_operator(current_solution, destroy_op)
+            partial_solution, removed_cities, destroy_time = self._apply_destroy_operator(current_solution, destroy_op)
             
             # Apply repair operator
-            new_solution = self._apply_repair_operator(partial_solution, removed_cities, repair_op)
+            new_solution, repair_time = self._apply_repair_operator(partial_solution, removed_cities, repair_op)
             new_value = self.tsp_solver.calculate_tour_length(new_solution)
+            
+            # Update timing statistics
+            self.destroy_total_time[destroy_op] += destroy_time
+            self.repair_total_time[repair_op] += repair_time
+            
+            # Update cumulative statistics
+            self.destroy_total_usage[destroy_op] += 1
+            self.repair_total_usage[repair_op] += 1
+            self.destroy_cumulative_time[destroy_op] += destroy_time
+            self.repair_cumulative_time[repair_op] += repair_time
             
             # Evaluate solution and update scores
             if new_value < current_value:
@@ -484,12 +559,52 @@ class ALNSAlgorithm:
             # Update operator weights at end of segment
             if segment_count == self.params.segment_length:
                 self._update_operator_weights()
+                self._update_timing_statistics()
                 segment_count = 0
                 print(f"Iteration {iteration_count}: Updated operator weights")
-                print(f"  Destroy probabilities: {self.destroy_probabilities}")
-                print(f"  Repair probabilities: {self.repair_probabilities}")
+                print(f"  Destroy probabilities: {self.destroy_probabilities.tolist()}")
+                print(f"  Repair probabilities: {self.repair_probabilities.tolist()}")
+                print(f"  Destroy avg times (ms): {(self.destroy_avg_time * 1000).tolist()}")
+                print(f"  Repair avg times (ms): {(self.repair_avg_time * 1000).tolist()}")
         
         return best_solution, best_value, convergence_history
+    
+    def print_final_statistics(self):
+        """Print comprehensive final statistics including timing information."""
+        print("\nFinal Operator Statistics:")
+        print("=" * 40)
+        
+        print("\nDestroy Operators:")
+        operator_names = ["Random Removal", "Worst Distance Removal"]
+        for i in range(self.params.destroy_operators_count):
+            if i < len(operator_names):
+                name = operator_names[i]
+            else:
+                name = f"Destroy Op {i}"
+            
+            print(f"  {name}:")
+            print(f"    Usage count: {int(self.destroy_total_usage[i])}")
+            print(f"    Total time: {self.destroy_cumulative_time[i]:.4f}s")
+            if self.destroy_total_usage[i] > 0:
+                avg_time = self.destroy_cumulative_time[i] / self.destroy_total_usage[i]
+                print(f"    Average time: {avg_time * 1000:.3f}ms")
+            print(f"    Current probability: {self.destroy_probabilities[i]:.3f}")
+        
+        print("\nRepair Operators:")
+        operator_names = ["Greedy Insertion", "Noisy Greedy Insertion"]
+        for i in range(self.params.repair_operators_count):
+            if i < len(operator_names):
+                name = operator_names[i]
+            else:
+                name = f"Repair Op {i}"
+            
+            print(f"  {name}:")
+            print(f"    Usage count: {int(self.repair_total_usage[i])}")
+            print(f"    Total time: {self.repair_cumulative_time[i]:.4f}s")
+            if self.repair_total_usage[i] > 0:
+                avg_time = self.repair_cumulative_time[i] / self.repair_total_usage[i]
+                print(f"    Average time: {avg_time * 1000:.3f}ms")
+            print(f"    Current probability: {self.repair_probabilities[i]:.3f}")
 
 
 def load_tsp_data(filename: str) -> Tuple[List[str], np.ndarray]:
@@ -584,6 +699,71 @@ def plot_solution(city_names: List[str], city_coordinates: np.ndarray,
     plt.show()
 
 
+def plot_operator_timing_statistics(alns_algorithm: ALNSAlgorithm):
+    """
+    Plot timing statistics for destroy and repair operators.
+    
+    Args:
+        alns_algorithm: ALNS algorithm instance with timing data
+    """
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+    
+    # Destroy operators timing
+    destroy_names = ["Random\nRemoval", "Worst Distance\nRemoval"]
+    destroy_times = []
+    destroy_counts = []
+    
+    for i in range(alns_algorithm.params.destroy_operators_count):
+        if alns_algorithm.destroy_total_usage[i] > 0:
+            avg_time = alns_algorithm.destroy_cumulative_time[i] / alns_algorithm.destroy_total_usage[i]
+            destroy_times.append(avg_time * 1000)  # Convert to milliseconds
+        else:
+            destroy_times.append(0)
+        destroy_counts.append(int(alns_algorithm.destroy_total_usage[i]))
+    
+    bars1 = ax1.bar(destroy_names[:len(destroy_times)], destroy_times, 
+                    color=['skyblue', 'lightcoral'], alpha=0.7)
+    ax1.set_title('Average Execution Time - Destroy Operators')
+    ax1.set_ylabel('Average Time (ms)')
+    ax1.grid(True, alpha=0.3)
+    
+    # Add value labels on bars
+    for bar, time_val, count in zip(bars1, destroy_times, destroy_counts):
+        height = bar.get_height()
+        ax1.text(bar.get_x() + bar.get_width()/2., height + 0.01,
+                f'{time_val:.2f}ms\n({count} uses)',
+                ha='center', va='bottom', fontsize=10)
+    
+    # Repair operators timing
+    repair_names = ["Greedy\nInsertion", "Noisy Greedy\nInsertion"]
+    repair_times = []
+    repair_counts = []
+    
+    for i in range(alns_algorithm.params.repair_operators_count):
+        if alns_algorithm.repair_total_usage[i] > 0:
+            avg_time = alns_algorithm.repair_cumulative_time[i] / alns_algorithm.repair_total_usage[i]
+            repair_times.append(avg_time * 1000)  # Convert to milliseconds
+        else:
+            repair_times.append(0)
+        repair_counts.append(int(alns_algorithm.repair_total_usage[i]))
+    
+    bars2 = ax2.bar(repair_names[:len(repair_times)], repair_times, 
+                    color=['lightgreen', 'orange'], alpha=0.7)
+    ax2.set_title('Average Execution Time - Repair Operators')
+    ax2.set_ylabel('Average Time (ms)')
+    ax2.grid(True, alpha=0.3)
+    
+    # Add value labels on bars
+    for bar, time_val, count in zip(bars2, repair_times, repair_counts):
+        height = bar.get_height()
+        ax2.text(bar.get_x() + bar.get_width()/2., height + 0.01,
+                f'{time_val:.2f}ms\n({count} uses)',
+                ha='center', va='bottom', fontsize=10)
+    
+    plt.tight_layout()
+    plt.show()
+
+
 def main():
     """Main function to run ALNS algorithm on TSP instance."""
     print("ALNS TSP Solver")
@@ -620,8 +800,14 @@ def main():
         print(f"Best tour length: {best_value:.2f}")
         print(f"Total runtime: {elapsed_time:.2f} seconds")
         
+        # Print detailed operator timing statistics
+        alns.print_final_statistics()
+        
         # Plot results
         plot_solution(city_names, city_coordinates, best_solution, best_value, convergence_history)
+        
+        # Plot timing statistics
+        plot_operator_timing_statistics(alns)
         
     except Exception as e:
         print(f"Error: {e}")
